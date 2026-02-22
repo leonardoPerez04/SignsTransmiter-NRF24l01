@@ -1,0 +1,178 @@
+#include <Pantalla.h>
+#include <string.h>
+#include <stdlib.h>
+
+// --- HARDWARE NRF24 ---
+sbit CE  at GPIOC_ODR.B0;
+sbit CSN at GPIOC_ODR.B2;
+
+// --- CORRECCIÓN DE PINES LEDS ---
+// En tu main usaste PINMASK 9 y 8, así que debemos corregir esto aquí:
+sbit LED_ROJO   at GPIOB_ODR.B9; // Cambiado de B0 a B9
+sbit LED_AZUL   at GPIOB_ODR.B1;
+sbit LED_AMAR   at GPIOB_ODR.B2;
+sbit LED_VERDE  at GPIOB_ODR.B8; // Cambiado de B3 a B8 (Evita conflicto JTAG)
+
+char buffer_rx[33];
+char ultimo_mensaje[33] = "";
+
+// Variables para la lógica de "Toggle" (Interruptor)
+char comando_actual_procesado[33] = ""; 
+int contador_silencio = 0;
+
+// --------------------- PANTALLA RX (TU DISEÑO) ---------------------
+void Init_TFT_UI() {
+    InitPantalla();
+    TFT_Fill_Screen(CL_BLACK);
+    
+    // Marco y Encabezado
+    TFT_Set_Pen(CL_WHITE, 2);
+    TFT_Set_Brush(0, CL_BLACK, 0, 0, 0, 0); 
+    TFT_Rectangle(5, 5, 315, 235);
+    
+    TFT_Set_Pen(CL_WHITE, 1);
+    TFT_Set_Brush(1, 0x8410, 0, 0, 0, 0); 
+    TFT_Rectangle(6, 6, 314, 40);
+    
+    TFT_Set_Font(TFT_defaultFont, CL_WHITE, FO_HORIZONTAL);
+    TFT_Write_Text("MONITOR DE RECEPCION", 75, 15);
+    
+    TFT_Set_Font(TFT_defaultFont, CL_SILVER, FO_HORIZONTAL);
+    TFT_Write_Text("ESTADO DE LEDS:", 20, 70);
+}
+
+void MostrarRX(char *txt, unsigned int color) {
+    if (strcmp(ultimo_mensaje, txt) != 0) {
+        TFT_Set_Pen(CL_BLACK, 1);
+        TFT_Set_Brush(1, CL_BLACK, 0, LEFT_TO_RIGHT, CL_BLACK, CL_BLACK);
+        TFT_Rectangle(10, 90, 310, 210);
+
+        if(strcmp(txt, "ESPERANDO...") == 0) {
+             TFT_Set_Pen(CL_GRAY, 3);
+             TFT_Set_Brush(0, CL_BLACK, 0, 0, 0, 0); 
+             TFT_Circle(160, 130, 30); 
+        } else {
+             TFT_Set_Pen(CL_WHITE, 2);
+             TFT_Set_Brush(1, color, 0, 0, 0, 0); 
+             TFT_Circle(160, 130, 30); 
+        }
+
+        TFT_Set_Font(TFT_defaultFont, color, FO_HORIZONTAL);
+        if (strlen(txt) > 10) TFT_Write_Text(txt, 90, 175);
+        else TFT_Write_Text(txt, 110, 175);
+
+        strcpy(ultimo_mensaje, txt);
+    }
+}
+
+// --------------------- NRF24 CONFIG (Igual) ---------------------
+void Init_SPI() {
+    SPI1_Init_Advanced(_SPI_FPCLK_DIV64, _SPI_MASTER | _SPI_8_BIT |
+                       _SPI_CLK_IDLE_LOW | _SPI_FIRST_CLK_EDGE_TRANSITION |
+                       _SPI_MSB_FIRST | _SPI_SS_DISABLE | _SPI_SSM_ENABLE |
+                       _SPI_SSI_1, &_GPIO_MODULE_SPI1_PA567);
+}
+void nrf24_write_reg(char reg, char value) {
+    CSN = 0; SPI1_Write(0x20 | reg); SPI1_Write(value); CSN = 1;
+}
+void nrf24_config_rx() {
+    CE = 0;
+    nrf24_write_reg(0x00, 0x0F); nrf24_write_reg(0x01, 0x00); 
+    nrf24_write_reg(0x03, 0x03); nrf24_write_reg(0x05, 0x42); 
+    nrf24_write_reg(0x06, 0x0F); nrf24_write_reg(0x11, 32);    
+    CSN = 0; SPI1_Write(0x20 | 0x0A); 
+    SPI1_Write('A'); SPI1_Write('A'); SPI1_Write('A'); SPI1_Write('A'); SPI1_Write('A'); CSN = 1;
+    CSN = 0; SPI1_Write(0xE2); CSN = 1;
+    nrf24_write_reg(0x07, 0x70); 
+    CE = 1; Delay_ms(2);
+}
+char nrf24_data_ready() {
+    char status;
+    CSN = 0; status = SPI1_Read(0xFF); CSN = 1;
+    return (status & 0x40);
+}
+void nrf24_read_string(char *buf) {
+    char i;
+    CSN = 0; SPI1_Write(0x61); 
+    for(i=0; i<32; i++) buf[i] = SPI1_Read(0x00);
+    CSN = 1;
+    nrf24_write_reg(0x07, 0x40);
+}
+
+// --------------------- MAIN ---------------------
+void main() {
+    // 1. Configurar LEDS (Correctos PB9, PB1, PB2, PB8)
+    GPIO_Digital_Output(&GPIOB_BASE, _GPIO_PINMASK_9 | _GPIO_PINMASK_1 | _GPIO_PINMASK_2 | _GPIO_PINMASK_8);
+    
+    // IMPORTANTE: Asegurar estado inicial APAGADO (asumiendo lógica positiva)
+    LED_ROJO = 0; LED_AZUL = 0; LED_AMAR = 0; LED_VERDE = 0;
+
+    // 2. Control NRF
+    GPIO_Digital_Output(&GPIOC_BASE, _GPIO_PINMASK_0 | _GPIO_PINMASK_2);
+
+    Init_SPI();
+    Init_TFT_UI();
+    nrf24_config_rx();
+    
+    while (1) {
+        // --- CASO 1: Recibimos Datos ---
+        if (nrf24_data_ready()) {
+            memset(buffer_rx, 0, 33);
+            nrf24_read_string(buffer_rx);
+            
+            // Reiniciamos el contador de silencio porque estamos recibiendo algo
+            contador_silencio = 0;
+
+            // LOGICA TOGGLE:
+            // Solo actuamos si el mensaje recibido es diferente al que estamos procesando actualmente.
+            // Esto evita que el LED parpadee mientras mantienes el botón apretado.
+            
+            if (strcmp(buffer_rx, comando_actual_procesado) != 0) {
+            
+                if (strcmp(buffer_rx, "ROJO") == 0) {
+                    LED_ROJO = !LED_ROJO; // Invierte el estado (Prende si estaba apagado, Apaga si estaba prendido)
+                    if (LED_ROJO) MostrarRX("LED ROJO ON", CL_RED);
+                    else MostrarRX("LED ROJO OFF", CL_MAROON);
+                }
+                else if (strcmp(buffer_rx, "AZUL") == 0) {
+                    LED_AZUL = !LED_AZUL;
+                    if (LED_AZUL) MostrarRX("LED AZUL ON", CL_BLUE);
+                    else MostrarRX("LED AZUL OFF", 0x0010); // Azul muy oscuro
+                }
+                else if (strcmp(buffer_rx, "AMARILLO") == 0) {
+                    LED_AMAR = !LED_AMAR;
+                    if (LED_AMAR) MostrarRX("LED AMAR ON", CL_YELLOW);
+                    else MostrarRX("LED AMAR OFF", 0x4200); // Ocre
+                }
+                else if (strcmp(buffer_rx, "VERDE") == 0) {
+                    LED_VERDE = !LED_VERDE;
+                    if (LED_VERDE) MostrarRX("LED VERDE ON", CL_GREEN);
+                    else MostrarRX("LED VERDE OFF", 0x0400); // Verde oscuro
+                }
+                else if (strcmp(buffer_rx, "OFF") == 0) {
+                    LED_ROJO = 0; LED_AZUL = 0; LED_AMAR = 0; LED_VERDE = 0;
+                    MostrarRX("APAGADO TOTAL", CL_GRAY);
+                }
+
+                // Guardamos que ya atendimos este comando "ROJO" (o el que sea)
+                strcpy(comando_actual_procesado, buffer_rx);
+            }
+        }
+        // --- CASO 2: NO recibimos datos (Silencio) ---
+        else {
+             // Si el transmisor deja de enviar (soltaste el botón), contamos tiempo
+             contador_silencio++;
+             
+             // Si hay silencio por aprox. 150ms (30 ciclos * 5ms)
+             if (contador_silencio > 30) { 
+                 // Borramos el comando procesado.
+                 // Esto permite que si vuelves a apretar "ROJO", el sistema lo vea como "NUEVO"
+                 // y vuelva a entrar al IF para hacer el toggle (apagarlo).
+                 strcpy(comando_actual_procesado, ""); 
+                 contador_silencio = 0;
+             }
+        }
+        
+        Delay_ms(5);
+    }
+}
